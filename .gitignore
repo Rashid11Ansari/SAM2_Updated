@@ -1,0 +1,13 @@
+# model weights (downloaded automatically, 150 MB - 900 MB each)
+checkpoints/
+*.pt
+# environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# app output / logs
+logs/
+*.zip
+.DS_Store
