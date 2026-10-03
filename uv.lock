@@ -2651,7 +2651,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "gradio" },
+    { name = "gradio", specifier = ">=6.0" },
     { name = "imageio-ffmpeg" },
     { name = "matplotlib" },
     { name = "numpy" },
