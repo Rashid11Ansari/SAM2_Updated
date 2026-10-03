@@ -116,5 +116,3 @@ srun --partition=gpu-node-mig --gres=gpu:1g.33gb:1 --cpus-per-task=4 --mem=32G -
 | `requirements.txt` / `pyproject.toml` + `uv.lock` | dependencies for pip / uv |
 | `slurm/run_app.sh` | launcher for the Slurm cluster (option C) |
 | `checkpoints/` | model weights, downloaded automatically — not in git |
-
-SAM2 is pinned to commit `2b90b9f` so upstream changes can't break the app.
