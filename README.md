@@ -1,118 +1,122 @@
 # SAM2 Point-Prompt Video Labeling
 
-Upload a video, click points (or draw boxes) on a frame to mark objects, and Meta's
+Pick a video, click points (or draw boxes) on a frame to mark objects, and Meta's
 [SAM2](https://github.com/facebookresearch/sam2) tracks the masks through the whole video.
-Export as an overlay video, PNG masks, and COCO JSON — all from one web page (Gradio).
+Export as overlay video, PNG masks and COCO JSON -- all from one web page.
 
-There are three ways to run it. Pick one:
+A `uv` Python package: SAM2 logic in `model.py`, web UI (Gradio inside FastAPI/uvicorn) in `app.py`,
+started with one command. Runs on a laptop or as a Slurm job on a GPU node.
 
-| | Where it runs | GPU | Setup |
-|---|---|---|---|
-| **A. Google Colab** | Google's servers | free T4 | nothing to install |
-| **B. Your own computer** | your laptop / PC | NVIDIA GPU best; Apple Silicon or CPU works (slower) | ~5 min |
-| **C. Uni Rostock Slurm cluster** | GPU node (H200) | yes | needs cluster account |
+```
+SAM2_Updated/
+├── pyproject.toml          # dependencies + the `sam2-updated` command
+├── uv.lock                 # exact versions (commit it)
+├── run_slurm.sh            # Slurm job: MIG 33 GB slice + reverse tunnel
+├── notebooks/              # original Colab prototype
+└── src/sam2_updated/
+    ├── model.py            # SAM2 + video helpers (no UI, no globals)
+    └── app.py              # web layer + main()
+```
 
----
-
-## A. Google Colab (easiest)
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Rashid11Ansari/SAM2_Updated/blob/main/SAM2_Updated.ipynb)
-
-1. Click the badge above.
-2. `Runtime → Change runtime type → T4 GPU`.
-3. `Runtime → Run all`. Allow Google Drive access when asked (it caches the model weights there so later runs are fast).
-4. The last cell prints a `https://….gradio.live` link — open it.
-
----
-
-## B. Run locally
-
-### 1. Get the code
+## 1. Run locally
 
 ```bash
-git clone https://github.com/Rashid11Ansari/SAM2_Updated.git
+git clone git@github.com:Rashid11Ansari/SAM2_Updated.git
 cd SAM2_Updated
+uv sync                     # first time: installs everything into .venv
+uv run sam2-updated         # -> http://127.0.0.1:8000
 ```
-
-### 2. Install (choose **uv** or **pip**)
-
-**With [uv](https://docs.astral.sh/uv/) (recommended):**
-
-```bash
-# install uv once:  macOS/Linux:  curl -LsSf https://astral.sh/uv/install.sh | sh
-#                   Windows:      powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-uv sync
-```
-
-**With pip:**
-
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-Needs Python 3.10+ and `git` (used to install SAM2 from GitHub).
-
-> **Windows + NVIDIA GPU:** the default `torch` from PyPI is CPU-only on Windows.
-> Install the CUDA build *first*, then the rest:
-> ```bash
-> pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-> pip install -r requirements.txt
-> ```
-> (Linux gets a CUDA build by default; macOS uses Apple Silicon automatically.)
-
-### 3. Run
-
-```bash
-uv run python app.py               # or, with pip/venv active:  python app.py
-```
-
-Open **http://localhost:7860**. The first run downloads the model checkpoint into `checkpoints/` (one time).
 
 Options:
 
-| Flag | Meaning |
-|---|---|
-| `--model tiny\|small\|base_plus\|large` | model size (default `large`). Use `small`/`tiny` without an NVIDIA GPU |
-| `--port 7861` | different port |
-| `--share` | also print a public `gradio.live` link (e.g. to open on another device) |
-| `--compile` | `torch.compile` for faster tracking — NVIDIA + Linux only, slow first run |
+| Flag | Default | Meaning |
+|---|---|---|
+| `--data-dir` | `./data` | where videos are read from and exports written to |
+| `--port` | `8000` | web port |
+| `--host` | `127.0.0.1` | only this machine (reach it from elsewhere via SSH tunnel) |
+| `--model` | `large` | `tiny` / `small` / `base_plus` / `large` -- use `small`/`tiny` without an NVIDIA GPU |
+| `--checkpoint-dir` | `<data-dir>/checkpoints` | where the SAM2 weights live (downloaded on first start) |
+| `--compile` | off | `torch.compile` -- NVIDIA + Linux only, faster tracking after a slow first run |
 
-**What speed to expect:** NVIDIA GPU — real time-ish with `large`. Apple Silicon — works, use `small`.
-CPU only — very slow (a few seconds per frame with `tiny`); use Colab instead for real videos.
+GPU: NVIDIA (CUDA) is used automatically, Apple Silicon works (slower), CPU only is very slow.
+Windows + NVIDIA: PyPI's torch is CPU-only on Windows -- run on the cluster, or install the CUDA build of torch.
 
----
+## 2. Data folder
 
-## C. Uni Rostock Slurm cluster
-
-On the login node, inside the repo: `uv sync` once (the login node has internet, the GPU nodes may not).
-
-One-time: give the cluster an internal SSH key so the GPU node can tunnel back to the login node:
-
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/id_cluster -N "" -C "$USER-internal"
-cat ~/.ssh/id_cluster.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
-printf 'Host sl-li\n    IdentityFile ~/.ssh/id_cluster\n' >> ~/.ssh/config && chmod 600 ~/.ssh/config
+```
+<data-dir>/
+├── videos/        # put videos here -- they appear in the "Video" dropdown (or upload in the browser)
+├── outputs/       # every export: <video>_<date-time>/ (labeled_video.mp4, masks/, annotations.json) + .zip
+└── checkpoints/   # SAM2 weights
 ```
 
-Then each time — **terminal 1 (cluster):**
+Copy videos to the cluster from your laptop: `scp my_video.mp4 slurm:sam2-updated-data/videos/`
+Fetch results: `scp -r slurm:sam2-updated-data/outputs/<folder> .`
+
+## 3. SSH setup (once)
+
+**Laptop** -- key + `~/.ssh/config`:
 
 ```bash
-srun --partition=gpu-node-mig --gres=gpu:1g.33gb:1 --cpus-per-task=4 --mem=32G --time=04:00:00 --pty bash slurm/run_app.sh
+ssh-keygen -t ed25519 -C "<uni-username>@uni-rostock"
+ssh-copy-id <uni-username>@sl-li.informatik.uni-rostock.de
+ssh-add --apple-use-keychain ~/.ssh/id_ed25519      # macOS; Linux: eval "$(ssh-agent -s)" && ssh-add
 ```
 
-**terminal 2 (your laptop):** `ssh -N -L 8917:localhost:8917 slurm` → open **http://localhost:8917**.
-`Ctrl+C` in terminal 1 frees the GPU. If port 8917 is taken, prefix the `srun` with `SAM2_PORT=8931` and use 8931 in terminal 2.
+```
+Host slurm
+    HostName sl-li.informatik.uni-rostock.de
+    User <uni-username>
+    IdentityFile ~/.ssh/id_ed25519
+    AddKeysToAgent yes
+    ForwardAgent yes        # git clone/push on the cluster with your laptop key
+    # ProxyJump <gateway>   # only if you have to hop through a gateway first
+```
 
----
+Add the public key (`cat ~/.ssh/id_ed25519.pub`) to GitHub -> Settings -> SSH and GPG keys, then
+`ssh slurm` and `ssh -T git@github.com` should both work without a password.
 
-## Files
+**Cluster** -- the job must SSH back to the login node without a password. Test:
 
-| File | What it is |
-|---|---|
-| `SAM2_Updated.ipynb` | Colab notebook (option A) |
-| `app.py` | same app as a standalone script (options B and C) |
-| `requirements.txt` / `pyproject.toml` + `uv.lock` | dependencies for pip / uv |
-| `slurm/run_app.sh` | launcher for the Slurm cluster (option C) |
-| `checkpoints/` | model weights, downloaded automatically — not in git |
+```bash
+srun -p compute-node -t 1 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new sl-li true
+```
+
+If that says `Permission denied`, create a cluster-only key that can only open tunnels:
+
+```bash
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519_cluster
+echo "restrict,port-forwarding,command=\"echo tunnel-only key\" $(cat ~/.ssh/id_ed25519_cluster.pub)" >> ~/.ssh/authorized_keys
+printf '\nHost sl-li\n    IdentityFile ~/.ssh/id_ed25519_cluster\n' >> ~/.ssh/config
+chmod 600 ~/.ssh/authorized_keys ~/.ssh/config
+```
+
+## 4. Run on the Slurm cluster (GPU job)
+
+```
+laptop ──ssh -L──▶ login node sl-li ◀──ssh -R── GPU node: sam2-updated on 127.0.0.1:PORT
+```
+
+On the login node, inside the repo:
+
+```bash
+uv sync                           # once, needs internet (login node only)
+mkdir -p logs && sbatch run_slurm.sh
+squeue --me                       # wait for state R
+cat $(ls -t logs/sam2-updated-*.out | head -1)   # newest log: shows the ssh -L line and the URL
+```
+
+On your laptop: run the printed `ssh -N -L <PORT>:localhost:<PORT> slurm` and open `http://localhost:<PORT>`.
+Stop: `scancel <jobid>` (frees the GPU).
+
+`run_slurm.sh` requests one ~33 GB MIG slice (`gpu-node-mig`, `gpu:1g.33gb:1`) for 4 h, uses a port derived from
+your user id (no clashes), stores data in `~/sam2-updated-data`, and puts extracted frames on the node's `/scratch`.
+Override with environment variables, e.g. `sbatch --export=ALL,SAM2_MODEL=small,SAM2_DATA_DIR=$HOME/mydata run_slurm.sh`
+(also `SAM2_PORT`).
+
+## 5. Google Colab (original prototype)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Rashid11Ansari/SAM2_Updated/blob/main/notebooks/SAM2_Updated.ipynb)
+
+`Runtime -> Change runtime type -> T4 GPU`, then `Runtime -> Run all`; open the printed `gradio.live` link.
+The notebook is the first prototype -- new features are in the Python package.
