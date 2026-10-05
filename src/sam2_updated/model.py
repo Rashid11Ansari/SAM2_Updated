@@ -209,19 +209,38 @@ def slug(text: str) -> str:
 
 def iter_overlay_video(frames_dir: Path, frame_names: list[str], segments: Segments, fps: float,
                        out_path: Path) -> Iterator[tuple[int, int]]:
-    """Write an mp4 with coloured masks, yielding (frames_done, total) after each frame.
+    """Write an H.264 mp4 with coloured masks, yielding (frames_done, total) after each frame.
+
+    H.264 (not OpenCV's mp4v) so it plays directly in every browser and in QuickTime -- the
+    bundled imageio-ffmpeg binary has libx264, so this works without a system ffmpeg (cluster).
     Stop early by simply not consuming the rest (the file is closed either way)."""
     h, w = cv2.imread(os.path.join(frames_dir, frame_names[0])).shape[:2]
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    cmd = [find_ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.6f}", "-i", "-",
+           "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",          # libx264/yuv420p needs even sizes
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", str(out_path)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    finished = False
     try:
         for i, name in enumerate(frame_names):
             frame = cv2.imread(os.path.join(frames_dir, name)).astype(np.float32)
             for oid, mask in segments.get(i, {}).items():
                 frame[mask] = frame[mask] * 0.5 + color_for(oid)[::-1] * 0.5   # frames are BGR here
-            writer.write(frame.astype(np.uint8))
+            proc.stdin.write(frame.astype(np.uint8).tobytes())
             yield i + 1, len(frame_names)
+        finished = True
     finally:
-        writer.release()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        if finished:
+            if proc.wait() != 0:
+                raise RuntimeError("ffmpeg could not write the video: " + proc.stderr.read().decode(errors="ignore")[-300:])
+        else:
+            proc.kill()
+            proc.wait()
 
 
 def write_overlay_video(frames_dir: Path, frame_names: list[str], segments: Segments, fps: float,
