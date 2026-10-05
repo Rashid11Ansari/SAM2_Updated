@@ -46,6 +46,21 @@ KEYBOARD_JS = """
     const btn = document.getElementById(id);
     if (btn && btn.offsetParent !== null) { e.preventDefault(); btn.click(); }
   });
+  // keep the chosen playback speed when the preview video is (re)loaded or played
+  window.__sam2Rate = window.__sam2Rate || 1;
+  const applyRate = (e) => {
+    const v = e.target;
+    if (v && v.tagName === 'VIDEO' && v.closest && v.closest('#preview-video')) v.playbackRate = window.__sam2Rate;
+  };
+  document.addEventListener('loadeddata', applyRate, true);
+  document.addEventListener('play', applyRate, true);
+}
+"""
+SET_SPEED_JS = """
+(speed) => {
+  window.__sam2Rate = parseFloat(speed) || 1;
+  document.querySelectorAll('#preview-video video').forEach(v => { v.playbackRate = window.__sam2Rate; });
+  return speed;
 }
 """
 CSS = """
@@ -178,7 +193,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
     # ------------------------------------------------------------ load
     def label_controls(visible):
         v = gr.update(visible=visible)
-        return {nav_group: v, prev_btn: v, next_btn: v, frame_slider: v, label_type: v, prompt_mode: v,
+        return {nav_group: v, track_backward: v, prev_btn: v, next_btn: v, frame_slider: v, label_type: v, prompt_mode: v,
                 obj_name_box: v, legend_md: v, new_obj_btn: v, undo_btn: v,
                 export_overlay: v, export_masks: v, export_json: v}
 
@@ -253,6 +268,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                                          visible=True),
                 status: "Loaded. Name your first object (optional), then click the image to add points -- or switch to Box mode.",
                 tabs: gr.Tabs(selected=1),
+                preview_video: None, download: None,     # never show results of a previous video
             }
         except Exception as e:  # keep the UI usable and show the reason
             shutil.rmtree(frames_dir, ignore_errors=True)
@@ -370,7 +386,15 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         return render_current(), "Nothing left to undo.", legend_html(), gr.update(interactive=any_prompts()), gr.update(), gr.update()
 
     # ------------------------------------------------------------ propagate
-    def propagate():
+    def first_prompt_frames():
+        """obj_id -> earliest frame that has a point/box for that object."""
+        first = {}
+        for (f, oid), e in S["points"].items():
+            if e["points"] or e.get("box"):
+                first[oid] = min(f, first.get(oid, f))
+        return first
+
+    def propagate(track_backward):
         def busy(text):
             return {propagate_btn: gr.update(value=text, interactive=False),
                     stop_prop_btn: gr.update(visible=True, value="Stop", interactive=True)}
@@ -401,6 +425,25 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 if time.time() - last_ui > UI_UPDATE_EVERY:
                     last_ui = time.time()
                     yield busy(f"Propagating {count}/{total}")
+            # optional backward pass: from the latest click back to frame 0, used only for frames
+            # BEFORE each object's first click (forward results stay where they exist)
+            if track_backward and not stopped:
+                first = first_prompt_frames()
+                start = max(first.values())
+                if start > 0:
+                    for count, (f_idx, masks) in enumerate(
+                            model.propagate(predictor, S["inference_state"], device, reverse=True, start_frame=start), start=1):
+                        merged = dict(segments.get(f_idx, {}))
+                        for oid, m in masks.items():
+                            if f_idx < first.get(oid, 0):
+                                merged[oid] = m
+                        segments[f_idx] = merged
+                        if S["stop_requested"]:
+                            stopped = True
+                            break
+                        if time.time() - last_ui > UI_UPDATE_EVERY:
+                            last_ui = time.time()
+                            yield busy(f"Tracking backward {count}/{start + 1}")
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             secs = time.time() - t_start
@@ -409,6 +452,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
             if stopped:
                 S["stop_requested"] = False
                 yield {**idle(), **show_frame(S["cur_frame_idx"]), export_btn: gr.update(interactive=bool(segments)),
+                       download: None,
                        status: f"Stopped after {len(segments)}/{total} frames -- those masks are kept. "
                                "Check them on the Label tab, add corrections, and propagate again, or export the partial result."}
                 return
@@ -425,10 +469,11 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                     last_ui = time.time()
                     yield busy(f"Rendering preview {done}/{n}")
             fps_done = len(segments) / secs if secs > 0 else 0.0
+            direction = " (forward + backward)" if track_backward else ""
             yield {**idle(), **show_frame(S["cur_frame_idx"]), preview_video: str(preview_path),
-                   export_btn: gr.update(interactive=True), tabs: gr.Tabs(selected=2),
-                   status: f"Propagated across {len(segments)} frames in {secs:.1f}s ({fps_done:.1f} fps). "
-                           "Ready to export -- or go back to the Label tab, check for drift on another frame, add a correction, and propagate again."}
+                   export_btn: gr.update(interactive=True), tabs: gr.Tabs(selected=2), download: None,
+                   status: f"Propagated across {len(segments)} frames{direction} in {secs:.1f}s ({fps_done:.1f} fps). "
+                           "Press Export to save these masks -- or go back to the Label tab, check another frame, add a correction, and propagate again."}
         except Exception as e:
             S["stop_requested"] = False
             yield {**idle(), status: f"Error while propagating: {e}"}
@@ -469,6 +514,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         return {**label_controls(False), image_display: None, frame_slider: gr.update(value=0, visible=False),
                 propagate_btn: gr.update(visible=False, interactive=False, value=PROPAGATE_LABEL),
                 export_btn: gr.update(visible=False, interactive=False), video_info_md: gr.update(visible=False),
+                preview_video: None, download: None,
                 status: "Session reset -- GPU memory freed. Pick a video to start again.", tabs: gr.Tabs(selected=0)}
 
     # ------------------------------------------------------------ layout
@@ -507,6 +553,9 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 with gr.Row():
                     propagate_btn = gr.Button(PROPAGATE_LABEL, variant="primary", visible=False, interactive=False, scale=3)
                     stop_prop_btn = gr.Button("Stop", variant="stop", visible=False, scale=1)
+                track_backward = gr.Checkbox(value=False, label="Also track backward (before the first click)", visible=False,
+                                             info="Off: masks start at each object's first click. On: also fills earlier frames "
+                                                  "(may be weak where the animal is barely visible).")
 
                 gr.Markdown("### 4. Export")
                 export_overlay = gr.Checkbox(value=True, label="Overlay video", visible=False)
@@ -524,13 +573,14 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                         image_display = gr.Image(label="Click to add points, or draw a box  (arrow keys: previous / next frame)",
                                                  interactive=False, format="jpeg")
                     with gr.Tab("3. Preview & download", id=2):
-                        preview_video = gr.Video(label="Preview")
+                        preview_video = gr.Video(label="Preview", elem_id="preview-video")
+                        play_speed = gr.Radio(["0.1x", "0.25x", "0.5x", "1x", "2x"], value="1x", label="Playback speed")
                         download = gr.File(label="Download")
 
         all_outputs = [load_btn, stop_load_btn, reset_btn, status, video_info_md,
                        nav_group, prev_btn, frame_slider, next_btn, label_type, prompt_mode, obj_name_box, legend_md,
                        new_obj_btn, undo_btn, propagate_btn, stop_prop_btn,
-                       export_overlay, export_masks, export_json, export_btn,
+                       export_overlay, export_masks, export_json, export_btn, track_backward,
                        image_display, preview_video, download, tabs]
         nav_outputs = [image_display, frame_slider]
         GPU = dict(concurrency_id="gpu", concurrency_limit=1)   # SAM2 calls never run at the same time
@@ -553,7 +603,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         new_obj_btn.click(new_object, outputs=[status, legend_md, obj_name_box])
         undo_btn.click(undo_point, outputs=[image_display, status, legend_md, propagate_btn, frame_slider, obj_name_box], **GPU)
 
-        propagate_btn.click(propagate, outputs=all_outputs, show_progress="hidden", **GPU)
+        propagate_btn.click(propagate, inputs=[track_backward], outputs=all_outputs, show_progress="hidden", **GPU)
+        play_speed.change(None, inputs=[play_speed], outputs=[play_speed], js=SET_SPEED_JS)
         stop_prop_btn.click(request_stop, outputs=[stop_prop_btn], queue=False, show_progress="hidden")
 
         export_btn.click(export, inputs=[export_overlay, export_masks, export_json], outputs=[download, status])

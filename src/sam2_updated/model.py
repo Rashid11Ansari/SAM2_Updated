@@ -161,10 +161,13 @@ def warm_features(predictor, state, device: torch.device, frame_idx: int) -> Non
         predictor._get_image_feature(state, frame_idx, 1)
 
 
-def propagate(predictor, state, device: torch.device) -> Iterator[tuple[int, Masks]]:
-    """Track every prompted object through the whole video, one frame at a time."""
+def propagate(predictor, state, device: torch.device, reverse: bool = False,
+              start_frame: int | None = None) -> Iterator[tuple[int, Masks]]:
+    """Track every prompted object one frame at a time.
+    Forward (default): from the earliest prompted frame to the end.
+    reverse=True: from start_frame back to frame 0 (covers frames before an object's first click)."""
     with torch.inference_mode(), autocast(device):
-        for frame_idx, obj_ids, logits in predictor.propagate_in_video(state):
+        for frame_idx, obj_ids, logits in predictor.propagate_in_video(state, start_frame_idx=start_frame, reverse=reverse):
             yield frame_idx, {oid: (logits[i] > 0.0).cpu().numpy().squeeze(0) for i, oid in enumerate(obj_ids)}
 
 
