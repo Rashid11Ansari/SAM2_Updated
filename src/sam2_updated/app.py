@@ -1,4 +1,5 @@
-"""Web layer: Gradio UI mounted in FastAPI, started by `uv run sam2-updated`.
+"""Web layer: Gradio UI mounted in FastAPI, started by `uv run sam2-updated`
+(or by launch_colab() from the Colab notebook -- same UI, same features).
 
 Data folder layout (--data-dir, default ./data):
     videos/       input videos -- copy them here (scp) or upload in the browser
@@ -561,23 +562,40 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
     return demo
 
 
-def create_app(data_dir: Path, model_size: str, checkpoint_dir: Path, compile_model: bool = False) -> FastAPI:
+def _setup(data_dir: Path, model_size: str, checkpoint_dir: Path | None, compile_model: bool):
+    """Shared start-up for every way of running the app: device, model, data folder, UI."""
     data_dir = Path(data_dir).expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = Path(checkpoint_dir).expanduser() if checkpoint_dir else data_dir / "checkpoints"
     device = model.pick_device()
     print("Device:", model.describe_device(device), flush=True)
     predictor = model.load_predictor(model_size, checkpoint_dir, device, compile_model)
     print(f"SAM2 video predictor ({model_size}) loaded on {device}", flush=True)
     print(f"Data folder: {data_dir}", flush=True)
+    return data_dir, device, build_ui(predictor, device, data_dir)
 
+
+def create_app(data_dir: Path, model_size: str, checkpoint_dir: Path | None = None, compile_model: bool = False) -> FastAPI:
+    """FastAPI app with the UI mounted at / -- used by `uv run sam2-updated` (laptop, Slurm job)."""
+    data_dir, device, demo = _setup(data_dir, model_size, checkpoint_dir, compile_model)
     app = FastAPI()
 
     @app.get("/health")
     def health():
         return {"device": str(device), "model": model_size, "data_dir": str(data_dir)}
 
-    demo = build_ui(predictor, device, data_dir)
     return gr.mount_gradio_app(app, demo, path="/", allowed_paths=[str(data_dir)], js=KEYBOARD_JS, css=CSS)
+
+
+def launch_colab(data_dir: str | Path = "/content/sam2-data", model_size: str = "large",
+                 checkpoint_dir: str | Path | None = None, compile_model: bool = False, share: bool = True):
+    """Google Colab / Jupyter: the SAME app, opened through a public gradio.live link.
+
+    Use a Google Drive folder as data_dir (e.g. /content/drive/MyDrive/sam2-data) to keep videos,
+    exports and the downloaded model weights between Colab sessions.
+    """
+    data_dir, _, demo = _setup(Path(data_dir), model_size, checkpoint_dir, compile_model)
+    demo.queue().launch(share=share, debug=True, allowed_paths=[str(data_dir)], js=KEYBOARD_JS, css=CSS)
 
 
 def main():
@@ -594,9 +612,7 @@ def main():
                    help="torch.compile the model -- NVIDIA + Linux only; slow first run, faster tracking after")
     args = p.parse_args()
 
-    data_dir = args.data_dir.expanduser()
-    checkpoint_dir = (args.checkpoint_dir or data_dir / "checkpoints").expanduser()
-    app = create_app(data_dir, args.model, checkpoint_dir, args.compile)
+    app = create_app(args.data_dir, args.model, args.checkpoint_dir, args.compile)
     print(f"\nOpen http://localhost:{args.port} in your browser", flush=True)
     # access_log=False: don't print every browser request (one line per image) -- keeps the job log readable
     uvicorn.run(app, host=args.host, port=args.port, access_log=False)

@@ -12,7 +12,7 @@ SAM2_Updated/
 ├── pyproject.toml          # dependencies + the `sam2-updated` command
 ├── uv.lock                 # exact versions (commit it)
 ├── run_slurm.sh            # Slurm job: MIG 33 GB slice + reverse tunnel
-├── notebooks/              # original Colab prototype
+├── notebooks/              # Colab launcher (runs the same app)
 └── src/sam2_updated/
     ├── model.py            # SAM2 + video helpers (no UI, no globals)
     └── app.py              # web layer + main()
@@ -114,9 +114,13 @@ your user id (no clashes), stores data in `~/sam2-updated-data`, and puts extrac
 Override with environment variables, e.g. `sbatch --export=ALL,SAM2_MODEL=small,SAM2_DATA_DIR=$HOME/mydata run_slurm.sh`
 (also `SAM2_PORT`).
 
-## 5. Google Colab (original prototype)
+## 5. Google Colab
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Rashid11Ansari/SAM2_Updated/blob/main/notebooks/SAM2_Updated.ipynb)
 
-`Runtime -> Change runtime type -> T4 GPU`, then `Runtime -> Run all`; open the printed `gradio.live` link.
-The notebook is the first prototype -- new features are in the Python package.
+The notebook installs this package from GitHub and starts **the same app** (`launch_colab()`) with a public
+`gradio.live` link -- same features as on the cluster, nothing to keep in sync.
+
+1. `Runtime -> Change runtime type -> T4 GPU`, then run the cells top to bottom.
+2. With `USE_DRIVE = True`, videos / exports / model weights live in `MyDrive/sam2-data/` and survive the session.
+3. Open the printed `https://....gradio.live` link.
