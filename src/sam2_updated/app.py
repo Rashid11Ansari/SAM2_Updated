@@ -160,7 +160,14 @@ def _run_warmup(predictor, device: torch.device, gate: GpuGate):
             gate.lock.release()
         gate.state = "ready"
         how = "stopped early, your propagate already warmed it" if gate.user_warmed else "complete"
-        print(f"[timing] GPU warm-up done in {time.time() - t0:.1f}s ({how}; {steps} steps, GPU busy {busy:.1f}s, longest step {longest:.2f}s)", flush=True)
+        print(f"[timing] GPU warm-up done in {time.time() - t0:.1f}s ({how}; {steps} steps, GPU busy {busy:.1f}s, longest step {longest:.2f}s; GPU memory reserved {_gpu_mem()})", flush=True)
+
+
+def _gpu_mem() -> str:
+    """GPU memory PyTorch holds (for the [timing] log): small before the first run = cold GPU."""
+    if not torch.cuda.is_available():
+        return "n/a"
+    return f"{torch.cuda.memory_reserved() / 2**30:.1f} GB"
 
 
 def _gpu_light(gate: GpuGate) -> str:
@@ -340,8 +347,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path, gate: GpuGate | No
             frame_cache.clear()
             if old_frames_dir:
                 shutil.rmtree(old_frames_dir, ignore_errors=True)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # no torch.cuda.empty_cache() here: PyTorch reuses the freed memory for this video, and
+            # keeping it is what makes the GPU "warm" (Reset session still frees everything)
 
             n = len(frame_names)
             print(f"[timing] load {video_name}: {t_extract + t_gpu:.1f}s (extract frames {t_extract:.1f}s, "
@@ -508,9 +515,13 @@ def build_ui(predictor, device: torch.device, data_dir: Path, gate: GpuGate | No
             with gate.user():                      # tracking = GPU; the preview below is CPU only
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                mem_before = _gpu_mem()
                 t_start = last_ui = time.time()
+                t_first20 = None
                 for count, (f_idx, masks) in enumerate(model.propagate(predictor, S["inference_state"], device), start=1):
                     segments[f_idx] = masks
+                    if count == 20:
+                        t_first20 = time.time() - t_start
                     if S["stop_requested"]:
                         stopped = True
                         break
@@ -540,6 +551,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path, gate: GpuGate | No
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 secs = time.time() - t_start
+                mem_after = _gpu_mem()
                 S["video_segments"] = segments
             if not stopped:
                 gate.user_warmed = True
@@ -568,7 +580,10 @@ def build_ui(predictor, device: torch.device, data_dir: Path, gate: GpuGate | No
             direction = " (forward + backward)" if track_backward else ""
             t_bwd = secs - t_fwd
             parts = f"tracking {t_fwd:.1f}s" + (f" + backward {t_bwd:.1f}s" if track_backward else "") + f" · preview {t_prev:.1f}s"
-            print(f"[timing] propagate: {len(segments)} frames in {secs:.1f}s, {parts} ({fps_done:.1f} fps)", flush=True)
+            first20 = (f", first 20 frames {t_first20:.1f}s ({20 / t_first20:.1f} fps)"
+                       if t_first20 and len(segments) > 20 else "")
+            print(f"[timing] propagate: {len(segments)} frames in {secs:.1f}s, {parts} ({fps_done:.1f} fps){first20}; "
+                  f"GPU memory reserved {mem_before} -> {mem_after}", flush=True)
             yield {**idle(), **show_frame(S["cur_frame_idx"]), preview_video: str(preview_path),
                    export_btn: gr.update(interactive=True), tabs: gr.Tabs(selected=2), download: None,
                    status: f"Propagated across {len(segments)} frames{direction} in {secs:.1f}s ({fps_done:.1f} fps). "
