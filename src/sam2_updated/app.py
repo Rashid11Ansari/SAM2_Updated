@@ -54,6 +54,56 @@ KEYBOARD_JS = """
   };
   document.addEventListener('loadeddata', applyRate, true);
   document.addEventListener('play', applyRate, true);
+
+  // Review: frame number under the preview. fps / frame count come from data-* of #preview-frame-info.
+  // Same time -> frame rule for the counter and the "Fix this frame" button, so they always agree.
+  window.__sam2FrameAt = (t) => {
+    const info = document.getElementById('preview-frame-info');
+    if (!info) return -1;
+    const fps = parseFloat(info.dataset.fps), n = parseInt(info.dataset.n);
+    if (!(fps > 0) || !(n > 0)) return -1;
+    return Math.max(0, Math.min(n - 1, Math.floor(t * fps + 1e-3)));
+  };
+  const previewVideo = (e) => {
+    const v = e.target;
+    return (v && v.tagName === 'VIDEO' && v.closest && v.closest('#preview-video')) ? v : null;
+  };
+  const showFrame = (e) => {
+    const v = previewVideo(e);
+    const info = document.getElementById('preview-frame-info');
+    if (!v || !info) return;
+    const n = parseInt(info.dataset.n), f = window.__sam2FrameAt(v.currentTime);
+    if (f >= 0) info.textContent = `Frame ${f}  (0 - ${n - 1})`;
+  };
+  ['timeupdate', 'seeked', 'loadeddata'].forEach(t => document.addEventListener(t, showFrame, true));
+}
+"""
+FIX_FRAME_JS = """
+(x) => {
+  const v = document.querySelector('#preview-video video');
+  if (!v) return -1;
+  v.pause();
+  return window.__sam2FrameAt(v.currentTime);
+}
+"""
+# Runs after Propagate has finished: open the new preview at the frame that was just fixed (data-seek).
+# Gradio's player resets its time to 0 right after a new video arrives, so check that the seek landed and retry.
+SEEK_FIXED_FRAME_JS = """
+() => {
+  const info = document.getElementById('preview-frame-info');
+  const v = document.querySelector('#preview-video video');
+  if (!info || !v || !info.dataset.seek) return;
+  const fps = parseFloat(info.dataset.fps), f = parseInt(info.dataset.seek);
+  delete info.dataset.seek;                         // only once per new preview
+  const target = (f + 0.5) / fps;                   // middle of the frame -> no off-by-one
+  let tries = 0;
+  const go = () => {
+    if (v.readyState < 2) { v.addEventListener('loadeddata', () => setTimeout(go, 100), {once: true}); return; }
+    v.pause();
+    v.currentTime = target;
+    setTimeout(() => { if (Math.abs(v.currentTime - target) > 0.5 / fps && ++tries < 10) go(); }, 200);
+  };
+  setTimeout(go, 100);
 }
 """
 SET_SPEED_JS = """
@@ -87,6 +137,7 @@ def _fresh_session() -> dict:
         "video_segments": {},  # frame_idx -> {obj_id: mask} from the last propagation
         "action_history": [],  # what Undo pops: {"frame_idx", "obj_id", "type": "point"|"box"}
         "stop_requested": False,
+        "review_frame": None,  # frame opened with "Fix this frame"; the next preview starts there
     }
 
 
@@ -269,6 +320,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 status: "Loaded. Name your first object (optional), then click the image to add points -- or switch to Box mode.",
                 tabs: gr.Tabs(selected=1),
                 preview_video: None, download: None,     # never show results of a previous video
+                frame_info: gr.update(value="", visible=False), fix_btn: gr.update(visible=False),
             }
         except Exception as e:  # keep the UI usable and show the reason
             shutil.rmtree(frames_dir, ignore_errors=True)
@@ -385,6 +437,24 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
             return img, msg, legend_html(), gr.update(interactive=any_prompts()), gr.update(value=f), gr.update(value=name)
         return render_current(), "Nothing left to undo.", legend_html(), gr.update(interactive=any_prompts()), gr.update(), gr.update()
 
+    # ------------------------------------------------------------ review (fix a frame seen in the preview)
+    def frame_info_html(seek=None):
+        """Frame counter under the preview. The browser reads fps / frame count / seek frame from its data-*."""
+        n = len(S["frame_names"])
+        seek_attr = f' data-seek="{int(seek)}"' if seek is not None else ""
+        return (f'<div id="preview-frame-info" data-fps="{S["fps"]:.6f}" data-n="{n}"{seek_attr}>'
+                f'Frame {0 if seek is None else int(seek)}  (0 - {n - 1})</div>')
+
+    def fix_frame(idx):
+        n = len(S["frame_names"])
+        if n == 0 or idx is None or idx < 0:
+            return {status: "Play or scrub the preview to the frame you want to fix, then press it again."}
+        idx = min(int(idx), n - 1)
+        S["review_frame"] = idx
+        return {**show_frame(idx), tabs: gr.Tabs(selected=1),
+                status: f"Frame {idx}: click where the mask is wrong ({obj_name(S['cur_obj_id'])}) -- foreground "
+                        "where it is missing, background where it is too much -- then propagate again."}
+
     # ------------------------------------------------------------ propagate
     def first_prompt_frames():
         """obj_id -> earliest frame that has a point/box for that object."""
@@ -470,7 +540,9 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                     yield busy(f"Rendering preview {done}/{n}")
             fps_done = len(segments) / secs if secs > 0 else 0.0
             direction = " (forward + backward)" if track_backward else ""
+            seek, S["review_frame"] = S["review_frame"], None
             yield {**idle(), **show_frame(S["cur_frame_idx"]), preview_video: str(preview_path),
+                   frame_info: gr.update(value=frame_info_html(seek), visible=True), fix_btn: gr.update(visible=True),
                    export_btn: gr.update(interactive=True), tabs: gr.Tabs(selected=2), download: None,
                    status: f"Propagated across {len(segments)} frames{direction} in {secs:.1f}s ({fps_done:.1f} fps). "
                            "Press Export to save these masks -- or go back to the Label tab, check another frame, add a correction, and propagate again."}
@@ -515,6 +587,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 propagate_btn: gr.update(visible=False, interactive=False, value=PROPAGATE_LABEL),
                 export_btn: gr.update(visible=False, interactive=False), video_info_md: gr.update(visible=False),
                 preview_video: None, download: None,
+                frame_info: gr.update(value="", visible=False), fix_btn: gr.update(visible=False),
                 status: "Session reset -- GPU memory freed. Pick a video to start again.", tabs: gr.Tabs(selected=0)}
 
     # ------------------------------------------------------------ layout
@@ -574,6 +647,10 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                                                  interactive=False, format="jpeg")
                     with gr.Tab("3. Preview & download", id=2):
                         preview_video = gr.Video(label="Preview", elem_id="preview-video")
+                        with gr.Row(equal_height=True):
+                            frame_info = gr.HTML(visible=False)
+                            fix_btn = gr.Button("Fix this frame", visible=False, variant="secondary")
+                        fix_idx = gr.Number(visible=False)   # frame index, filled in by FIX_FRAME_JS
                         play_speed = gr.Radio(["0.1x", "0.25x", "0.5x", "1x", "2x"], value="1x", label="Playback speed")
                         download = gr.File(label="Download")
 
@@ -581,7 +658,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                        nav_group, prev_btn, frame_slider, next_btn, label_type, prompt_mode, obj_name_box, legend_md,
                        new_obj_btn, undo_btn, propagate_btn, stop_prop_btn,
                        export_overlay, export_masks, export_json, export_btn, track_backward,
-                       image_display, preview_video, download, tabs]
+                       image_display, preview_video, download, tabs, frame_info, fix_btn]
         nav_outputs = [image_display, frame_slider]
         GPU = dict(concurrency_id="gpu", concurrency_limit=1)   # SAM2 calls never run at the same time
 
@@ -603,7 +680,10 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         new_obj_btn.click(new_object, outputs=[status, legend_md, obj_name_box])
         undo_btn.click(undo_point, outputs=[image_display, status, legend_md, propagate_btn, frame_slider, obj_name_box], **GPU)
 
-        propagate_btn.click(propagate, inputs=[track_backward], outputs=all_outputs, show_progress="hidden", **GPU)
+        propagate_btn.click(propagate, inputs=[track_backward], outputs=all_outputs, show_progress="hidden", **GPU
+                            ).then(None, js=SEEK_FIXED_FRAME_JS)
+        fix_btn.click(fix_frame, inputs=[fix_idx], outputs=[image_display, frame_slider, tabs, status],
+                      js=FIX_FRAME_JS, show_progress="hidden").then(warm, show_progress="hidden", **GPU)
         play_speed.change(None, inputs=[play_speed], outputs=[play_speed], js=SET_SPEED_JS)
         stop_prop_btn.click(request_stop, outputs=[stop_prop_btn], queue=False, show_progress="hidden")
 
