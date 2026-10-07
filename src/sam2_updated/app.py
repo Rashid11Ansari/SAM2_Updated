@@ -106,6 +106,16 @@ SEEK_FIXED_FRAME_JS = """
   setTimeout(go, 100);
 }
 """
+# The number box next to the frame slider sends whatever is typed (605 for a 104-frame video, or nothing),
+# which Gradio rejects with an error. Clamp to the slider's range; empty/invalid -> flag it (-1) so Python
+# keeps the current frame and puts the number back.
+CLAMP_FRAME_JS = """
+(v, flag) => {
+  const r = document.querySelector('#frame-slider input[type=range]');
+  const max = r ? parseInt(r.max) : 0, n = parseInt(v);
+  return Number.isNaN(n) ? [0, -1] : [Math.max(0, Math.min(max, n)), 0];
+}
+"""
 SET_SPEED_JS = """
 (speed) => {
   window.__sam2Rate = parseFloat(speed) || 1;
@@ -336,9 +346,11 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         S["pending_box"] = None
         return {image_display: render_current(), frame_slider: gr.update(value=idx)}
 
-    def scrub_frame(new_idx):
+    def scrub_frame(new_idx, invalid):
+        if invalid:   # number box emptied/garbage: stay on the current frame and restore the box
+            return show_frame(S["cur_frame_idx"]).get(image_display, gr.update()), gr.update(value=S["cur_frame_idx"])
         # Only the picture goes back while dragging -- sending the slider value too would fight the drag.
-        return show_frame(new_idx).get(image_display, gr.update())
+        return show_frame(new_idx).get(image_display, gr.update()), gr.update()
 
     def step_frame(delta):
         return show_frame(S["cur_frame_idx"] + delta)
@@ -611,7 +623,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 with gr.Group(elem_id="frame-nav-box", visible=False) as nav_group:
                     with gr.Row(elem_id="frame-nav", equal_height=True):
                         prev_btn = gr.Button("<", visible=False, scale=0, min_width=44, elem_id="prev-frame-btn")
-                        frame_slider = gr.Slider(0, 1, step=1, value=0, label="Frame", visible=False, scale=8)
+                        frame_slider = gr.Slider(0, 1, step=1, value=0, label="Frame", visible=False, scale=8, elem_id="frame-slider")
+                        scrub_invalid = gr.Number(value=0, visible=False)   # set by CLAMP_FRAME_JS
                         next_btn = gr.Button(">", visible=False, scale=0, min_width=44, elem_id="next-frame-btn")
                 label_type = gr.Radio(["foreground", "background"], value="foreground", label="Point type", visible=False)
                 prompt_mode = gr.Radio(["Point", "Box"], value="Point", label="Prompt mode", visible=False)
@@ -667,8 +680,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         load_btn.click(load_video, inputs=[video_select], outputs=all_outputs, show_progress="hidden", **GPU)
         stop_load_btn.click(request_stop, outputs=[stop_load_btn], queue=False, show_progress="hidden")
 
-        frame_slider.input(scrub_frame, inputs=[frame_slider], outputs=[image_display], show_progress="hidden",
-                           trigger_mode="always_last").then(warm, show_progress="hidden", **GPU)
+        frame_slider.input(scrub_frame, inputs=[frame_slider, scrub_invalid], outputs=[image_display, frame_slider],
+                           show_progress="hidden", trigger_mode="always_last", js=CLAMP_FRAME_JS).then(warm, show_progress="hidden", **GPU)
         prev_btn.click(lambda: step_frame(-1), outputs=nav_outputs, show_progress="hidden", trigger_mode="multiple"
                        ).then(warm, show_progress="hidden", **GPU)
         next_btn.click(lambda: step_frame(+1), outputs=nav_outputs, show_progress="hidden", trigger_mode="multiple"
