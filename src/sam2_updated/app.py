@@ -144,6 +144,9 @@ CSS = """
 #prev-frame-btn, #next-frame-btn { min-width: 44px !important; max-width: 52px; height: 44px; font-size: 18px; align-self: center;
   border: 1px solid var(--border-color-primary); background: var(--button-secondary-background-fill); border-radius: 8px; }
 #prev-frame-btn:hover, #next-frame-btn:hover { background: var(--button-secondary-background-fill-hover); }
+/* the image / video side stays in view while the controls on the left are scrolled */
+.gradio-container { overflow: clip !important; }   /* 'hidden' would switch off sticky below; 'clip' looks the same */
+#right-col { position: sticky; top: 8px; align-self: flex-start; max-height: calc(100vh - 16px); overflow-y: auto; }
 """ + "".join(  # object list: entry k gets the mask colour of object k (same palette as model.color_for)
     f"#object-list label:nth-of-type({k}) {{ border-left: 8px solid rgb{model._PALETTE[k % 10]} !important; }}\n"
     for k in range(1, 51))
@@ -223,12 +226,17 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
     def frame_with_prompts(idx):
         return model.draw_prompts(frame_rgb(idx), prompts_on(idx))
 
+    def current_on_top(masks):
+        """Draw the selected object last, so its mask is not hidden under another object's mask."""
+        cur = S["cur_obj_id"]
+        return {**{o: m for o, m in masks.items() if o != cur}, **({cur: masks[cur]} if cur in masks else {})}
+
     def render_current():
         idx = S["cur_frame_idx"]
         img = frame_with_prompts(idx)
         seg = S["video_segments"].get(idx)
         if seg:
-            model.overlay_masks(img, seg, alpha=0.4)
+            model.overlay_masks(img, current_on_top(seg), alpha=0.4)
         return img.astype(np.uint8)
 
     def recompute(idx, oid, entry):
@@ -236,7 +244,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                                  entry["points"], entry["labels"], entry.get("box"))
 
     def image_with_masks(idx, masks):
-        return model.overlay_masks(frame_with_prompts(idx), masks).astype(np.uint8)
+        return model.overlay_masks(frame_with_prompts(idx), current_on_top(masks)).astype(np.uint8)
 
     def video_choices():
         return model.list_videos(video_dir)
@@ -379,10 +387,10 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
 
     def select_object(oid):
         if oid is None or int(oid) not in S["obj_names"]:
-            return gr.update(), object_list(), gr.update()
+            return gr.update(), object_list(), gr.update(), gr.update()
         S["cur_obj_id"], S["pending_box"] = int(oid), None
         name = obj_name(S["cur_obj_id"])
-        return f"Now placing points for {name}.", object_list(), gr.update(value=name)
+        return f"Now placing points for {name}.", object_list(), gr.update(value=name), render_current()
 
     def new_object():
         S["cur_obj_id"] = max([S["cur_obj_id"], *S["obj_names"]]) + 1
@@ -669,7 +677,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 export_json = gr.Checkbox(value=True, label="COCO JSON", visible=False)
                 export_btn = gr.Button("Export", visible=False, interactive=False)
 
-            with gr.Column(scale=2):
+            with gr.Column(scale=2, elem_id="right-col"):
                 with gr.Tabs() as tabs:
                     with gr.Tab("1. Upload", id=0):
                         gr.Markdown(f"Pick a video on the left -- or upload one here; it is saved to `{video_dir}`.")
@@ -709,9 +717,11 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
 
         image_display.select(on_image_click, inputs=[prompt_mode, label_type],
                              outputs=[image_display, status, legend_md, propagate_btn], show_progress="hidden", **GPU)
-        obj_name_box.change(rename_object, inputs=[obj_name_box], outputs=[legend_md], show_progress="hidden")
+        obj_name_box.input(rename_object, inputs=[obj_name_box], outputs=[legend_md], show_progress="hidden",
+                           trigger_mode="always_last")
         new_obj_btn.click(new_object, outputs=[status, legend_md, obj_name_box])
-        legend_md.input(select_object, inputs=[legend_md], outputs=[status, legend_md, obj_name_box], show_progress="hidden")
+        legend_md.input(select_object, inputs=[legend_md], outputs=[status, legend_md, obj_name_box, image_display],
+                        show_progress="hidden")
         undo_btn.click(undo_point, outputs=[image_display, status, legend_md, propagate_btn, frame_slider, obj_name_box], **GPU)
 
         propagate_btn.click(propagate, inputs=[track_backward], outputs=all_outputs, show_progress="hidden", **GPU
