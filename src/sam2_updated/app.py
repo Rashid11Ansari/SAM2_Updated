@@ -76,6 +76,23 @@ KEYBOARD_JS = """
     if (f >= 0) info.textContent = `Frame ${f}  (0 - ${n - 1})`;
   };
   ['timeupdate', 'seeked', 'loadeddata'].forEach(t => document.addEventListener(t, showFrame, true));
+  // Show frame f in the preview, paused. Gradio's player sometimes resets its time to 0 right after a new
+  // video arrives or the tab is shown, so check that the seek landed and retry.
+  window.__sam2SeekPreview = (f) => {
+    const info = document.getElementById('preview-frame-info');
+    if (!info) return;
+    const fps = parseFloat(info.dataset.fps), target = (f + 0.5) / fps;   // middle of the frame -> no off-by-one
+    let tries = 0;
+    const go = () => {
+      const v = document.querySelector('#preview-video video');
+      if (!v) { if (++tries < 20) setTimeout(go, 100); return; }
+      if (v.readyState < 2) { v.addEventListener('loadeddata', () => setTimeout(go, 100), {once: true}); return; }
+      v.pause();
+      if (Math.abs(v.currentTime - target) > 0.5 / fps) v.currentTime = target;
+      setTimeout(() => { if (Math.abs(v.currentTime - target) > 0.5 / fps && ++tries < 20) go(); }, 200);
+    };
+    setTimeout(go, 100);
+  };
 }
 """
 FIX_FRAME_JS = """
@@ -87,23 +104,21 @@ FIX_FRAME_JS = """
 }
 """
 # Runs after Propagate has finished: open the new preview at the frame that was just fixed (data-seek).
-# Gradio's player resets its time to 0 right after a new video arrives, so check that the seek landed and retry.
 SEEK_FIXED_FRAME_JS = """
 () => {
   const info = document.getElementById('preview-frame-info');
-  const v = document.querySelector('#preview-video video');
-  if (!info || !v || !info.dataset.seek) return;
-  const fps = parseFloat(info.dataset.fps), f = parseInt(info.dataset.seek);
+  if (!info || !info.dataset.seek) return;
+  const f = parseInt(info.dataset.seek);
   delete info.dataset.seek;                         // only once per new preview
-  const target = (f + 0.5) / fps;                   // middle of the frame -> no off-by-one
-  let tries = 0;
-  const go = () => {
-    if (v.readyState < 2) { v.addEventListener('loadeddata', () => setTimeout(go, 100), {once: true}); return; }
-    v.pause();
-    v.currentTime = target;
-    setTimeout(() => { if (Math.abs(v.currentTime - target) > 0.5 / fps && ++tries < 10) go(); }, 200);
-  };
-  setTimeout(go, 100);
+  window.__sam2SeekPreview(f);
+}
+"""
+# Clicking the Preview tab: show the frame the Label tab is on (paused).
+SYNC_PREVIEW_JS = """
+(f) => {
+  const info = document.getElementById('preview-frame-info');
+  if (!info || info.dataset.seek || f === null || f === undefined) return;   // pending seek after Propagate wins
+  window.__sam2SeekPreview(parseInt(f));
 }
 """
 # The number box next to the frame slider sends whatever is typed (605 for a 104-frame video, or nothing),
@@ -129,7 +144,9 @@ CSS = """
 #prev-frame-btn, #next-frame-btn { min-width: 44px !important; max-width: 52px; height: 44px; font-size: 18px; align-self: center;
   border: 1px solid var(--border-color-primary); background: var(--button-secondary-background-fill); border-radius: 8px; }
 #prev-frame-btn:hover, #next-frame-btn:hover { background: var(--button-secondary-background-fill-hover); }
-"""
+""" + "".join(  # object list: entry k gets the mask colour of object k (same palette as model.color_for)
+    f"#object-list label:nth-of-type({k}) {{ border-left: 8px solid rgb{model._PALETTE[k % 10]} !important; }}\n"
+    for k in range(1, 51))
 
 
 def _fresh_session() -> dict:
@@ -190,19 +207,15 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
     def any_prompts():
         return any(v["points"] or v.get("box") for v in S["points"].values())
 
-    def legend_html():
-        if not any_prompts():
-            return f"_No prompts yet -- click the image to add a point for **{obj_name(S['cur_obj_id'])}**, or draw a box._"
-        rows = []
-        for oid in sorted({o for (_, o) in S["points"]} | {S["cur_obj_id"]}):
-            r, g, b = model.color_for(oid).astype(int)
+    def object_list(**extra):
+        """The clickable object list (replaces the old legend): one entry per object, in its mask colour (CSS)."""
+        choices = []
+        for oid in sorted(S["obj_names"]):      # ids are 1..n without gaps, so entry k has the colour of object k
             n_pts = sum(len(v["points"]) for k, v in S["points"].items() if k[1] == oid)
             has_box = any(v.get("box") for k, v in S["points"].items() if k[1] == oid)
             parts = ([f"{n_pts} point(s)"] if n_pts else []) + (["box"] if has_box else [])
-            current = " <b>(current)</b>" if oid == S["cur_obj_id"] else ""
-            rows.append(f'<span style="color: rgb({r},{g},{b}); font-size:16px;">&#9679;</span> '
-                        f'{obj_name(oid)} -- {" + ".join(parts) or "no prompts yet"}{current}')
-        return "<br>".join(rows)
+            choices.append((f"{obj_name(oid)} -- {' + '.join(parts) or 'no prompts yet'}", oid))
+        return gr.update(choices=choices, value=S["cur_obj_id"], **extra)
 
     def prompts_on(idx):
         return {o: e for (f, o), e in S["points"].items() if f == idx}
@@ -322,7 +335,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 image_display: gr.update(value=frame_rgb(0).astype(np.uint8), visible=True),
                 frame_slider: gr.update(maximum=max(0, n - 1), value=0, visible=True, label=f"Frame  (0 - {n - 1})"),
                 obj_name_box: gr.update(value=obj_name(1), visible=True),
-                legend_md: gr.update(value=legend_html(), visible=True),
+                legend_md: object_list(visible=True),
                 propagate_btn: gr.update(visible=True, interactive=False, value=PROPAGATE_LABEL),
                 export_btn: gr.update(visible=True, interactive=False),
                 video_info_md: gr.update(value=f"**{video_name}** &middot; {n} frames &middot; {fps:.1f} fps &middot; {n / fps:.1f}s",
@@ -362,19 +375,26 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
     # ------------------------------------------------------------ objects
     def rename_object(name):
         S["obj_names"][S["cur_obj_id"]] = (name or "").strip() or f"Object {S['cur_obj_id']}"
-        return legend_html()
+        return object_list()
+
+    def select_object(oid):
+        if oid is None or int(oid) not in S["obj_names"]:
+            return gr.update(), object_list(), gr.update()
+        S["cur_obj_id"], S["pending_box"] = int(oid), None
+        name = obj_name(S["cur_obj_id"])
+        return f"Now placing points for {name}.", object_list(), gr.update(value=name)
 
     def new_object():
         S["cur_obj_id"] = max([S["cur_obj_id"], *S["obj_names"]]) + 1
         oid = S["cur_obj_id"]
         S["obj_names"].setdefault(oid, f"Object {oid}")
         S["pending_box"] = None
-        return f"Now placing prompts for {obj_name(oid)}. Type a name above if you like.", legend_html(), gr.update(value=obj_name(oid))
+        return f"Now placing prompts for {obj_name(oid)}. Type a name above if you like.", object_list(), gr.update(value=obj_name(oid))
 
     # ------------------------------------------------------------ clicks / undo
     def click_impl(prompt_mode, label_type, evt):
         if S["frames_dir"] is None:
-            return None, "Load a video first.", legend_html(), gr.update(interactive=False)
+            return None, "Load a video first.", object_list(), gr.update(interactive=False)
         x, y = evt.index
         idx, oid = S["cur_frame_idx"], S["cur_obj_id"]
         name, key = obj_name(oid), (idx, oid)
@@ -384,13 +404,13 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 S["pending_box"] = (x, y)
                 img = frame_with_prompts(idx)
                 cv2.drawMarker(img, (int(x), int(y)), (255, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2)
-                return img.astype(np.uint8), "Box mode: click the opposite corner to finish the box.", legend_html(), gr.update(interactive=any_prompts())
+                return img.astype(np.uint8), "Box mode: click the opposite corner to finish the box.", object_list(), gr.update(interactive=any_prompts())
             x0, y0 = S["pending_box"]
             S["pending_box"] = None
             entry = S["points"].setdefault(key, {"points": [], "labels": [], "box": None})
             entry["box"] = [min(x0, x), min(y0, y), max(x0, x), max(y0, y)]
             push_history(idx, oid, "box")
-            return image_with_masks(idx, recompute(idx, oid, entry)), f"{name}: box set on frame {idx}.", legend_html(), gr.update(interactive=True)
+            return image_with_masks(idx, recompute(idx, oid, entry)), f"{name}: box set on frame {idx}.", object_list(), gr.update(interactive=True)
 
         entry = S["points"].get(key)
         if entry and entry["points"]:
@@ -406,14 +426,14 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                     del S["points"][key]
                     img = frame_with_prompts(idx).astype(np.uint8)
                     msg = f"Removed the only prompt for {name} on frame {idx}. Click to redefine it."
-                return img, msg, legend_html(), gr.update(interactive=any_prompts())
+                return img, msg, object_list(), gr.update(interactive=any_prompts())
 
         entry = S["points"].setdefault(key, {"points": [], "labels": [], "box": None})
         entry["points"].append([x, y])
         entry["labels"].append(1 if label_type == "foreground" else 0)
         push_history(idx, oid, "point")
         return (image_with_masks(idx, recompute(idx, oid, entry)),
-                f"{name}: {len(entry['points'])} point(s) placed on frame {idx}.", legend_html(), gr.update(interactive=True))
+                f"{name}: {len(entry['points'])} point(s) placed on frame {idx}.", object_list(), gr.update(interactive=True))
 
     def on_image_click(prompt_mode, label_type, evt: gr.SelectData):
         t0 = time.time()
@@ -446,8 +466,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 del S["points"][(f, oid)]
                 img = render_current()
                 msg = f"Removed the last prompt for {name} on frame {f}. Add a new point or box to redefine it."
-            return img, msg, legend_html(), gr.update(interactive=any_prompts()), gr.update(value=f), gr.update(value=name)
-        return render_current(), "Nothing left to undo.", legend_html(), gr.update(interactive=any_prompts()), gr.update(), gr.update()
+            return img, msg, object_list(), gr.update(interactive=any_prompts()), gr.update(value=f), gr.update(value=name)
+        return render_current(), "Nothing left to undo.", object_list(), gr.update(interactive=any_prompts()), gr.update(), gr.update()
 
     # ------------------------------------------------------------ review (fix a frame seen in the preview)
     def frame_info_html(seek=None):
@@ -630,7 +650,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 prompt_mode = gr.Radio(["Point", "Box"], value="Point", label="Prompt mode", visible=False)
                 obj_name_box = gr.Textbox(label="Current object name", value="Object 1", visible=False,
                                           placeholder="e.g. Fish 1", max_lines=1)
-                legend_md = gr.Markdown(visible=False)
+                legend_md = gr.Radio(label="Objects -- click one to add points to it", visible=False, elem_id="object-list")
                 with gr.Row():
                     new_obj_btn = gr.Button("New object", visible=False)
                     undo_btn = gr.Button("Undo last prompt", visible=False)
@@ -658,7 +678,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                         # JPEG display: much smaller than PNG; SAM2 and the exports use the original frames.
                         image_display = gr.Image(label="Click to add points, or draw a box  (arrow keys: previous / next frame)",
                                                  interactive=False, format="jpeg")
-                    with gr.Tab("3. Preview & download", id=2):
+                    with gr.Tab("3. Preview & download", id=2) as preview_tab:
                         preview_video = gr.Video(label="Preview", elem_id="preview-video")
                         with gr.Row(equal_height=True):
                             frame_info = gr.HTML(visible=False)
@@ -691,12 +711,14 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                              outputs=[image_display, status, legend_md, propagate_btn], show_progress="hidden", **GPU)
         obj_name_box.change(rename_object, inputs=[obj_name_box], outputs=[legend_md], show_progress="hidden")
         new_obj_btn.click(new_object, outputs=[status, legend_md, obj_name_box])
+        legend_md.input(select_object, inputs=[legend_md], outputs=[status, legend_md, obj_name_box], show_progress="hidden")
         undo_btn.click(undo_point, outputs=[image_display, status, legend_md, propagate_btn, frame_slider, obj_name_box], **GPU)
 
         propagate_btn.click(propagate, inputs=[track_backward], outputs=all_outputs, show_progress="hidden", **GPU
                             ).then(None, js=SEEK_FIXED_FRAME_JS)
         fix_btn.click(fix_frame, inputs=[fix_idx], outputs=[image_display, frame_slider, tabs, status],
                       js=FIX_FRAME_JS, show_progress="hidden").then(warm, show_progress="hidden", **GPU)
+        preview_tab.select(None, inputs=[frame_slider], js=SYNC_PREVIEW_JS)
         play_speed.change(None, inputs=[play_speed], outputs=[play_speed], js=SET_SPEED_JS)
         stop_prop_btn.click(request_stop, outputs=[stop_prop_btn], queue=False, show_progress="hidden")
 
