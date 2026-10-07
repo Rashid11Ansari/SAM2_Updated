@@ -171,6 +171,44 @@ def propagate(predictor, state, device: torch.device, reverse: bool = False,
             yield frame_idx, {oid: (logits[i] > 0.0).cpu().numpy().squeeze(0) for i, oid in enumerate(obj_ids)}
 
 
+def iter_warm_up(predictor, device: torch.device, num_frames: int = 24) -> Iterator[str]:
+    """Warm the GPU with a small synthetic video, ONE SMALL GPU STEP PER next().
+
+    The caller runs each step only while the user is not using the GPU (see app.GpuGate), so the
+    warm-up never delays a load, a click or a propagation. On the first real propagation CUDA/PyTorch
+    pick their fastest kernels and grow memory pools (measured: 18.6 s first vs 10.7 s later for 104
+    frames on the MIG slice); doing it here hides that cost. 24 frames > SAM2's memory bank (7) and
+    object-pointer window (16); 2 objects so the multi-object path is warmed too."""
+    import tempfile as _tf
+    tmp = Path(_tf.mkdtemp(prefix="sam2_warmup_"))
+    state = None
+    try:
+        h, w = 360, 640                                   # CPU only: write the synthetic frames
+        rng = np.random.default_rng(0)
+        base = (rng.random((h, w, 3)) * 60 + 80).astype(np.uint8)
+        for i in range(num_frames):                       # two moving blobs on a noisy background
+            img = base.copy()
+            cv2.ellipse(img, (120 + 6 * i, 180), (60, 25), 0, 0, 360, (200, 200, 200), -1)
+            cv2.ellipse(img, (480 - 5 * i, 120), (50, 20), 0, 0, 360, (40, 40, 40), -1)
+            cv2.imwrite(str(tmp / f"{i:06d}.jpg"), img)
+        yield "frames"
+        state = init_session(predictor, tmp, device)      # frames to GPU + image encoder on frame 0
+        yield "session"
+        add_prompts(predictor, state, device, 0, 1, [[120, 180]], [1], None)
+        yield "click"
+        add_prompts(predictor, state, device, 0, 2, [[480, 120]], [1], [430, 100, 530, 140])
+        yield "click"
+        for _ in propagate(predictor, state, device):     # one frame per step
+            yield "propagate"
+    finally:
+        if state is not None:
+            predictor.reset_state(state)
+            del state
+        shutil.rmtree(tmp, ignore_errors=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------- drawing
 _PALETTE = [  # tab10 colours, RGB 0-255
     (31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189),

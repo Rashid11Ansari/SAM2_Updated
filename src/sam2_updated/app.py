@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import shutil
 import tempfile
+import threading
 import time
 import warnings
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -69,6 +71,7 @@ CSS = """
 #prev-frame-btn, #next-frame-btn { min-width: 44px !important; max-width: 52px; height: 44px; font-size: 18px; align-self: center;
   border: 1px solid var(--border-color-primary); background: var(--button-secondary-background-fill); border-radius: 8px; }
 #prev-frame-btn:hover, #next-frame-btn:hover { background: var(--button-secondary-background-fill-hover); }
+.gpu-light { text-align: right; font-size: 15px; white-space: nowrap; }
 """
 
 
@@ -90,7 +93,85 @@ def _fresh_session() -> dict:
     }
 
 
-def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
+class GpuGate:
+    """One GPU, two users: you and the background warm-up. YOU ALWAYS GO FIRST.
+
+    Every GPU call of yours (load, each click, undo, frame pre-analysis, propagate) runs inside
+    `with gate.user():`. The warm-up only takes the GPU for one tiny step when nobody is waiting,
+    so it can delay you by at most one step (one frame), never more."""
+
+    def __init__(self):
+        self.lock = threading.Lock()          # a plain Lock may be released from another thread (Gradio hops threads)
+        self._count_lock = threading.Lock()
+        self.waiting = 0
+        self.state = "off"                    # off (no NVIDIA GPU) | warming | ready
+        self.user_warmed = False              # your own propagate has warmed the GPU -> warm-up can stop
+
+    @contextmanager
+    def user(self):
+        with self._count_lock:
+            self.waiting += 1
+        self.lock.acquire()
+        with self._count_lock:
+            self.waiting -= 1
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def acquire_when_idle(self):
+        while True:
+            if self.waiting == 0 and self.lock.acquire(blocking=False):
+                if self.waiting == 0:
+                    return
+                self.lock.release()
+            time.sleep(0.01)
+
+
+def _run_warmup(predictor, device: torch.device, gate: GpuGate):
+    """Background thread: run model.iter_warm_up one step at a time, only while the GPU is idle."""
+    t0, busy, steps, longest = time.time(), 0.0, 0, 0.0
+    gen = model.iter_warm_up(predictor, device)
+    try:
+        while not gate.user_warmed:
+            gate.acquire_when_idle()
+            try:
+                t = time.time()
+                next(gen)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                busy += time.time() - t
+                longest = max(longest, time.time() - t)
+                steps += 1
+            except StopIteration:
+                break
+            finally:
+                gate.lock.release()
+            time.sleep(0.005)                 # let a waiting click in before the next step
+    except Exception as e:                    # the warm-up is optional -- never break the app
+        print(f"[timing] GPU warm-up skipped: {e}", flush=True)
+    finally:
+        gate.acquire_when_idle()
+        try:
+            gen.close()                       # frees the dummy session's GPU memory
+        except Exception:
+            pass
+        finally:
+            gate.lock.release()
+        gate.state = "ready"
+        how = "stopped early, your propagate already warmed it" if gate.user_warmed else "complete"
+        print(f"[timing] GPU warm-up done in {time.time() - t0:.1f}s ({how}; {steps} steps, GPU busy {busy:.1f}s, longest step {longest:.2f}s)", flush=True)
+
+
+def _gpu_light(gate: GpuGate) -> str:
+    if gate.state == "warming":
+        return '<div class="gpu-light">&#128993; GPU warming up&hellip; (you can start already)</div>'
+    if gate.state == "ready":
+        return '<div class="gpu-light">&#128994; GPU ready</div>'
+    return ""
+
+
+def build_ui(predictor, device: torch.device, data_dir: Path, gate: GpuGate | None = None) -> gr.Blocks:
     """All UI state lives in this closure -- nothing global."""
     video_dir = data_dir / "videos"
     output_dir = data_dir / "outputs"
@@ -98,6 +179,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
     output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg = model.find_ffmpeg()
 
+    gate = gate or GpuGate()
     S = _fresh_session()
     frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
 
@@ -158,8 +240,9 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         return img.astype(np.uint8)
 
     def recompute(idx, oid, entry):
-        return model.add_prompts(predictor, S["inference_state"], device, idx, oid,
-                                 entry["points"], entry["labels"], entry.get("box"))
+        with gate.user():
+            return model.add_prompts(predictor, S["inference_state"], device, idx, oid,
+                                     entry["points"], entry["labels"], entry.get("box"))
 
     def image_with_masks(idx, masks):
         return model.overlay_masks(frame_with_prompts(idx), masks).astype(np.uint8)
@@ -217,6 +300,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         frames_dir = Path(tempfile.mkdtemp(prefix="frames_"))
         try:
             fps, expected = model.video_info(video_path)
+            t_load = time.time()
             yield {**busy("Extracting frames... 0%"), status: f"Extracting frames from {video_name}..."}
             proc = model.start_frame_extraction(video_path, frames_dir, ffmpeg)
             while proc.poll() is None:
@@ -236,9 +320,13 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
             if not frame_names:
                 raise RuntimeError("No frames could be extracted from this video.")
 
+            t_extract = time.time() - t_load
             yield {**busy(f"Preparing SAM2 ({len(frame_names)} frames)..."), status: "Initializing SAM2 tracking session..."}
             old_frames_dir = S.get("frames_dir")
-            inference_state = model.init_session(predictor, frames_dir, device)
+            t_gpu = time.time()
+            with gate.user():
+                inference_state = model.init_session(predictor, frames_dir, device)
+            t_gpu = time.time() - t_gpu
             if S["stop_requested"]:
                 del inference_state
                 shutil.rmtree(frames_dir, ignore_errors=True)
@@ -256,6 +344,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 torch.cuda.empty_cache()
 
             n = len(frame_names)
+            print(f"[timing] load {video_name}: {t_extract + t_gpu:.1f}s (extract frames {t_extract:.1f}s, "
+                  f"frames to GPU {t_gpu:.1f}s, {n} frames)", flush=True)
             yield {
                 **idle(), **label_controls(True),
                 image_display: gr.update(value=frame_rgb(0).astype(np.uint8), visible=True),
@@ -266,7 +356,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 export_btn: gr.update(visible=True, interactive=False),
                 video_info_md: gr.update(value=f"**{video_name}** &middot; {n} frames &middot; {fps:.1f} fps &middot; {n / fps:.1f}s",
                                          visible=True),
-                status: "Loaded. Name your first object (optional), then click the image to add points -- or switch to Box mode.",
+                status: f"Loaded in {t_extract + t_gpu:.1f}s. Name your first object (optional), then click the image to add points -- or switch to Box mode.",
                 tabs: gr.Tabs(selected=1),
                 preview_video: None, download: None,     # never show results of a previous video
             }
@@ -293,7 +383,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
 
     def warm():
         if S["inference_state"] is not None:
-            model.warm_features(predictor, S["inference_state"], device, S["cur_frame_idx"])
+            with gate.user():
+                model.warm_features(predictor, S["inference_state"], device, S["cur_frame_idx"])
 
     # ------------------------------------------------------------ objects
     def rename_object(name):
@@ -414,40 +505,44 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         segments, stopped = {}, False
         try:
             yield {**busy(f"Propagating 0/{total}"), status: "Propagating masks through the video..."}
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t_start = last_ui = time.time()
-            for count, (f_idx, masks) in enumerate(model.propagate(predictor, S["inference_state"], device), start=1):
-                segments[f_idx] = masks
-                if S["stop_requested"]:
-                    stopped = True
-                    break
-                if time.time() - last_ui > UI_UPDATE_EVERY:
-                    last_ui = time.time()
-                    yield busy(f"Propagating {count}/{total}")
-            # optional backward pass: from the latest click back to frame 0, used only for frames
-            # BEFORE each object's first click (forward results stay where they exist)
-            if track_backward and not stopped:
-                first = first_prompt_frames()
-                start = max(first.values())
-                if start > 0:
-                    for count, (f_idx, masks) in enumerate(
-                            model.propagate(predictor, S["inference_state"], device, reverse=True, start_frame=start), start=1):
-                        merged = dict(segments.get(f_idx, {}))
-                        for oid, m in masks.items():
-                            if f_idx < first.get(oid, 0):
-                                merged[oid] = m
-                        segments[f_idx] = merged
-                        if S["stop_requested"]:
-                            stopped = True
-                            break
-                        if time.time() - last_ui > UI_UPDATE_EVERY:
-                            last_ui = time.time()
-                            yield busy(f"Tracking backward {count}/{start + 1}")
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            secs = time.time() - t_start
-            S["video_segments"] = segments
+            with gate.user():                      # tracking = GPU; the preview below is CPU only
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_start = last_ui = time.time()
+                for count, (f_idx, masks) in enumerate(model.propagate(predictor, S["inference_state"], device), start=1):
+                    segments[f_idx] = masks
+                    if S["stop_requested"]:
+                        stopped = True
+                        break
+                    if time.time() - last_ui > UI_UPDATE_EVERY:
+                        last_ui = time.time()
+                        yield busy(f"Propagating {count}/{total}")
+                # optional backward pass: from the latest click back to frame 0, used only for frames
+                # BEFORE each object's first click (forward results stay where they exist)
+                t_fwd = time.time() - t_start
+                if track_backward and not stopped:
+                    first = first_prompt_frames()
+                    start = max(first.values())
+                    if start > 0:
+                        for count, (f_idx, masks) in enumerate(
+                                model.propagate(predictor, S["inference_state"], device, reverse=True, start_frame=start), start=1):
+                            merged = dict(segments.get(f_idx, {}))
+                            for oid, m in masks.items():
+                                if f_idx < first.get(oid, 0):
+                                    merged[oid] = m
+                            segments[f_idx] = merged
+                            if S["stop_requested"]:
+                                stopped = True
+                                break
+                            if time.time() - last_ui > UI_UPDATE_EVERY:
+                                last_ui = time.time()
+                                yield busy(f"Tracking backward {count}/{start + 1}")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                secs = time.time() - t_start
+                S["video_segments"] = segments
+            if not stopped:
+                gate.user_warmed = True
 
             if stopped:
                 S["stop_requested"] = False
@@ -458,7 +553,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 return
 
             preview_path = Path(tempfile.mkdtemp(prefix="preview_")) / "preview.mp4"
-            last_ui = time.time()
+            t_prev = last_ui = time.time()
             for done, n in model.iter_overlay_video(S["frames_dir"], S["frame_names"], segments, S["fps"], preview_path):
                 if S["stop_requested"]:
                     S["stop_requested"] = False
@@ -468,8 +563,12 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 if time.time() - last_ui > UI_UPDATE_EVERY:
                     last_ui = time.time()
                     yield busy(f"Rendering preview {done}/{n}")
+            t_prev = time.time() - t_prev
             fps_done = len(segments) / secs if secs > 0 else 0.0
             direction = " (forward + backward)" if track_backward else ""
+            t_bwd = secs - t_fwd
+            parts = f"tracking {t_fwd:.1f}s" + (f" + backward {t_bwd:.1f}s" if track_backward else "") + f" · preview {t_prev:.1f}s"
+            print(f"[timing] propagate: {len(segments)} frames in {secs:.1f}s, {parts} ({fps_done:.1f} fps)", flush=True)
             yield {**idle(), **show_frame(S["cur_frame_idx"]), preview_video: str(preview_path),
                    export_btn: gr.update(interactive=True), tabs: gr.Tabs(selected=2), download: None,
                    status: f"Propagated across {len(segments)} frames{direction} in {secs:.1f}s ({fps_done:.1f} fps). "
@@ -487,19 +586,27 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         out = output_dir / f"{stem}_{datetime.now():%Y%m%d-%H%M%S}"
         out.mkdir(parents=True, exist_ok=True)
         names = {oid: obj_name(oid) for oid in S["obj_names"]}
+        times, t0 = [], time.time()
+        t_all = t0
         if do_overlay:
             model.write_overlay_video(S["frames_dir"], S["frame_names"], segments, S["fps"], out / "labeled_video.mp4",
                                       progress=lambda i, n: progress(0.6 * i / n, desc=f"Writing overlay video {i}/{n}"))
+            times.append(f"video {time.time() - t0:.1f}s"); t0 = time.time()
         if do_masks:
             progress(0.7, desc="Writing PNG masks...")
             model.write_png_masks(segments, names, out / "masks")
+            times.append(f"masks {time.time() - t0:.1f}s"); t0 = time.time()
         if do_json:
             progress(0.85, desc="Building COCO JSON...")
             model.write_coco_json(segments, names, Path(S["video_path"]).name, S["fps"], len(S["frame_names"]),
                                   out / "annotations.json")
+            times.append(f"json {time.time() - t0:.1f}s"); t0 = time.time()
         progress(1.0, desc="Zipping export...")
         zip_path = shutil.make_archive(str(out), "zip", out)
-        return zip_path, f"Export saved on the server: {out}  (zip: {zip_path}) -- download below."
+        times.append(f"zip {time.time() - t0:.1f}s")
+        total_s = time.time() - t_all
+        print(f"[timing] export: {' · '.join(times)}", flush=True)
+        return zip_path, f"Export saved on the server: {out}  (zip: {zip_path}) -- download below. (took {total_s:.1f}s)"
 
     # ------------------------------------------------------------ reset
     def reset_session():
@@ -519,7 +626,10 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
 
     # ------------------------------------------------------------ layout
     with gr.Blocks(title="SAM2 Point Labeling") as demo:
-        gr.Markdown("# SAM2 Point-Prompt Video Labeling")
+        with gr.Row(equal_height=True):
+            gr.Markdown("# SAM2 Point-Prompt Video Labeling")
+            gpu_light = gr.HTML(_gpu_light(gate), visible=gate.state != "off")
+        light_timer = gr.Timer(1.0, active=gate.state == "warming")
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown("### 1. Load")
@@ -610,6 +720,11 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         export_btn.click(export, inputs=[export_overlay, export_masks, export_json], outputs=[download, status])
         reset_btn.click(reset_session, outputs=all_outputs)
 
+        def tick():
+            return _gpu_light(gate), gr.Timer(active=gate.state == "warming")
+        light_timer.tick(tick, outputs=[gpu_light, light_timer], show_progress="hidden", queue=False)
+        demo.load(tick, outputs=[gpu_light, light_timer], show_progress="hidden", queue=False)
+
     return demo
 
 
@@ -622,8 +737,14 @@ def _setup(data_dir: Path, model_size: str, checkpoint_dir: Path | None, compile
     print("Device:", model.describe_device(device), flush=True)
     predictor = model.load_predictor(model_size, checkpoint_dir, device, compile_model)
     print(f"SAM2 video predictor ({model_size}) loaded on {device}", flush=True)
+    gate = GpuGate()
+    # Background warm-up on NVIDIA GPUs only (there the first propagate is ~1.8x slower).
+    # The page opens right away; the warm-up steps aside whenever you use the GPU.
+    if device.type == "cuda":
+        gate.state = "warming"
+        threading.Thread(target=_run_warmup, args=(predictor, device, gate), daemon=True, name="gpu-warmup").start()
     print(f"Data folder: {data_dir}", flush=True)
-    return data_dir, device, build_ui(predictor, device, data_dir)
+    return data_dir, device, build_ui(predictor, device, data_dir, gate)
 
 
 def create_app(data_dir: Path, model_size: str, checkpoint_dir: Path | None = None, compile_model: bool = False) -> FastAPI:
