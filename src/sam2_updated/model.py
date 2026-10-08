@@ -83,7 +83,11 @@ def load_predictor(model_size: str, checkpoint_dir: Path, device: torch.device, 
     checkpoint = ensure_checkpoint(model_size, checkpoint_dir)
     config = f"configs/sam2.1/sam2.1_hiera_{MODEL_SIZES[model_size]}.yaml"
     use_compile = compile_model and device.type == "cuda" and platform.system() == "Linux"
-    return build_sam2_video_predictor(config, str(checkpoint), device=device, vos_optimized=use_compile)
+    # Correction clicks on an already-tracked frame must become conditioning frames; with SAM2's default (False)
+    # they are kept only until the next propagate, which re-tracks that frame and overwrites the correction.
+    overrides = ["++model.add_all_frames_to_correct_as_cond=true"]
+    return build_sam2_video_predictor(config, str(checkpoint), device=device, vos_optimized=use_compile,
+                                      hydra_overrides_extra=overrides)
 
 
 # ---------------------------------------------------------------- video / frames
