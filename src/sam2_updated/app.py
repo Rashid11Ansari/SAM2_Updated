@@ -669,7 +669,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path, model_size: str = 
                 if model_choices:
                     labels = {"base_plus": "base_plus (faster)", "large": "large (more accurate)"}
                     model_select = gr.Dropdown([(labels.get(m, m), m) for m in model_choices], value=model_size,
-                                               label="Model", info="used from the next Load video")
+                                               label="Model")
                 with gr.Row():
                     load_btn = gr.Button(LOAD_LABEL, variant="primary", scale=3)
                     stop_load_btn = gr.Button("Stop", variant="stop", visible=False, scale=1)
