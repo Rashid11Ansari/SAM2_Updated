@@ -9,6 +9,7 @@ Data folder layout (--data-dir, default ./data):
 from __future__ import annotations
 
 import argparse
+import gc
 import shutil
 import tempfile
 import time
@@ -171,14 +172,17 @@ def _fresh_session() -> dict:
     }
 
 
-def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
-    """All UI state lives in this closure -- nothing global."""
+def build_ui(predictor, device: torch.device, data_dir: Path, model_size: str = "large",
+             model_choices: list[str] | None = None, load_model=None) -> gr.Blocks:
+    """All UI state lives in this closure -- nothing global.
+    model_choices + load_model (Colab only): a Model dropdown; the chosen model is swapped in on the next Load."""
     video_dir = data_dir / "videos"
     output_dir = data_dir / "outputs"
     video_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg = model.find_ffmpeg()
 
+    M = {"predictor": predictor, "size": model_size}   # the one SAM2 model in GPU memory
     S = _fresh_session()
     frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
 
@@ -240,7 +244,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         return img.astype(np.uint8)
 
     def recompute(idx, oid, entry):
-        return model.add_prompts(predictor, S["inference_state"], device, idx, oid,
+        return model.add_prompts(M["predictor"], S["inference_state"], device, idx, oid,
                                  entry["points"], entry["labels"], entry.get("box"))
 
     def image_with_masks(idx, masks):
@@ -279,7 +283,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 obj_name_box: v, legend_md: v, new_obj_btn: v, undo_btn: v,
                 export_overlay: v, export_masks: v, export_json: v}
 
-    def load_video(video_name):
+    def load_video(video_name, wanted_model=None):
         def busy(text):
             return {load_btn: gr.update(value=text, interactive=False),
                     stop_load_btn: gr.update(visible=True, value="Stop", interactive=True)}
@@ -287,6 +291,9 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
         def idle():
             return {load_btn: gr.update(value=LOAD_LABEL, interactive=True), stop_load_btn: gr.update(visible=False)}
 
+        if M["predictor"] is None and not (model_choices and wanted_model):
+            yield {**idle(), status: "No model loaded -- pick a model and press Load again."}
+            return
         if not video_name:
             yield {**idle(), status: f"Pick a video from the list (or upload one) first. Videos folder: {video_dir}"}
             return
@@ -296,6 +303,24 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
             return
 
         S["stop_requested"] = False
+        if model_choices and wanted_model and wanted_model != M["size"]:
+            yield {**busy(f"Loading model {wanted_model}..."),
+                   status: f"Switching SAM2 to {wanted_model} (the first time, the weights are downloaded)..."}
+            t0 = time.time()
+            try:
+                # free the old model AND the old session (its frames live on the GPU) before building the new one
+                S["inference_state"] = None
+                M["predictor"], M["size"] = None, None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                M["predictor"] = load_model(wanted_model)
+                M["size"] = wanted_model
+                print(f"[timing] model switch -> {wanted_model}: {time.time() - t0:.1f}s", flush=True)
+            except Exception as e:
+                yield {**reset_session(), **idle(), status: f"Could not load model {wanted_model}: {e}"}
+                return
+
         frames_dir = Path(tempfile.mkdtemp(prefix="frames_"))
         try:
             fps, expected = model.video_info(video_path)
@@ -320,7 +345,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
 
             yield {**busy(f"Preparing SAM2 ({len(frame_names)} frames)..."), status: "Initializing SAM2 tracking session..."}
             old_frames_dir = S.get("frames_dir")
-            inference_state = model.init_session(predictor, frames_dir, device)
+            inference_state = model.init_session(M["predictor"], frames_dir, device)
             if S["stop_requested"]:
                 del inference_state
                 shutil.rmtree(frames_dir, ignore_errors=True)
@@ -346,7 +371,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 legend_md: object_list(visible=True),
                 propagate_btn: gr.update(visible=True, interactive=False, value=PROPAGATE_LABEL),
                 export_btn: gr.update(visible=True, interactive=False),
-                video_info_md: gr.update(value=f"**{video_name}** &middot; {n} frames &middot; {fps:.1f} fps &middot; {n / fps:.1f}s",
+                video_info_md: gr.update(value=f"**{video_name}** &middot; {n} frames &middot; {fps:.1f} fps &middot; {n / fps:.1f}s"
+                                               + (f" &middot; model {M['size']}" if model_choices else ""),
                                          visible=True),
                 status: "Loaded. Name your first object (optional), then click the image to add points -- or switch to Box mode.",
                 tabs: gr.Tabs(selected=1),
@@ -378,7 +404,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
 
     def warm():
         if S["inference_state"] is not None:
-            model.warm_features(predictor, S["inference_state"], device, S["cur_frame_idx"])
+            model.warm_features(M["predictor"], S["inference_state"], device, S["cur_frame_idx"])
 
     # ------------------------------------------------------------ objects
     def rename_object(name):
@@ -527,7 +553,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_start = last_ui = time.time()
-            for count, (f_idx, masks) in enumerate(model.propagate(predictor, S["inference_state"], device), start=1):
+            for count, (f_idx, masks) in enumerate(model.propagate(M["predictor"], S["inference_state"], device), start=1):
                 segments[f_idx] = masks
                 if S["stop_requested"]:
                     stopped = True
@@ -542,7 +568,7 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                 start = max(first.values())
                 if start > 0:
                     for count, (f_idx, masks) in enumerate(
-                            model.propagate(predictor, S["inference_state"], device, reverse=True, start_frame=start), start=1):
+                            model.propagate(M["predictor"], S["inference_state"], device, reverse=True, start_frame=start), start=1):
                         merged = dict(segments.get(f_idx, {}))
                         for oid, m in masks.items():
                             if f_idx < first.get(oid, 0):
@@ -640,6 +666,10 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
                     video_select = gr.Dropdown(choices=video_choices(), value=(video_choices() or [None])[0],
                                                label="Video", info=f"from {video_dir}", scale=4)
                     refresh_btn = gr.Button("Refresh", scale=1, min_width=80)
+                if model_choices:
+                    labels = {"base_plus": "base_plus (faster)", "large": "large (more accurate)"}
+                    model_select = gr.Dropdown([(labels.get(m, m), m) for m in model_choices], value=model_size,
+                                               label="Model", info="used from the next Load video")
                 with gr.Row():
                     load_btn = gr.Button(LOAD_LABEL, variant="primary", scale=3)
                     stop_load_btn = gr.Button("Stop", variant="stop", visible=False, scale=1)
@@ -705,7 +735,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
 
         refresh_btn.click(refresh_videos, inputs=[video_select], outputs=[video_select], show_progress="hidden")
         video_upload.upload(on_upload, inputs=[video_upload], outputs=[video_select, status])
-        load_btn.click(load_video, inputs=[video_select], outputs=all_outputs, show_progress="hidden", **GPU)
+        load_btn.click(load_video, inputs=[video_select, model_select] if model_choices else [video_select],
+                       outputs=all_outputs, show_progress="hidden", **GPU)
         stop_load_btn.click(request_stop, outputs=[stop_load_btn], queue=False, show_progress="hidden")
 
         frame_slider.input(scrub_frame, inputs=[frame_slider, scrub_invalid], outputs=[image_display, frame_slider],
@@ -738,7 +769,8 @@ def build_ui(predictor, device: torch.device, data_dir: Path) -> gr.Blocks:
     return demo
 
 
-def _setup(data_dir: Path, model_size: str, checkpoint_dir: Path | None, compile_model: bool):
+def _setup(data_dir: Path, model_size: str, checkpoint_dir: Path | None, compile_model: bool,
+           model_choices: list[str] | None = None):
     """Shared start-up for every way of running the app: device, model, data folder, UI."""
     data_dir = Path(data_dir).expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -748,7 +780,10 @@ def _setup(data_dir: Path, model_size: str, checkpoint_dir: Path | None, compile
     predictor = model.load_predictor(model_size, checkpoint_dir, device, compile_model)
     print(f"SAM2 video predictor ({model_size}) loaded on {device}", flush=True)
     print(f"Data folder: {data_dir}", flush=True)
-    return data_dir, device, build_ui(predictor, device, data_dir)
+    load_model = lambda size: model.load_predictor(size, checkpoint_dir, device, compile_model)
+    if model_choices and model_size not in model_choices:
+        model_choices = [*model_choices, model_size]
+    return data_dir, device, build_ui(predictor, device, data_dir, model_size, model_choices, load_model)
 
 
 def create_app(data_dir: Path, model_size: str, checkpoint_dir: Path | None = None, compile_model: bool = False) -> FastAPI:
@@ -763,14 +798,18 @@ def create_app(data_dir: Path, model_size: str, checkpoint_dir: Path | None = No
     return gr.mount_gradio_app(app, demo, path="/", allowed_paths=[str(data_dir)], js=KEYBOARD_JS, css=CSS)
 
 
-def launch_colab(data_dir: str | Path = "/content/sam2-data", model_size: str = "large",
+COLAB_MODELS = ["base_plus", "large"]   # the Model dropdown on Colab (cluster/laptop: no dropdown)
+
+
+def launch_colab(data_dir: str | Path = "/content/sam2-data", model_size: str = "base_plus",
                  checkpoint_dir: str | Path | None = None, compile_model: bool = False, share: bool = True):
     """Google Colab / Jupyter: the SAME app, opened through a public gradio.live link.
 
     Use a Google Drive folder as data_dir (e.g. /content/drive/MyDrive/sam2-data) to keep videos,
     exports and the downloaded model weights between Colab sessions.
+    base_plus by default (a free T4 is much slower than the cluster); the Model dropdown switches on the next Load.
     """
-    data_dir, _, demo = _setup(Path(data_dir), model_size, checkpoint_dir, compile_model)
+    data_dir, _, demo = _setup(Path(data_dir), model_size, checkpoint_dir, compile_model, COLAB_MODELS)
     demo.queue().launch(share=share, debug=True, allowed_paths=[str(data_dir)], js=KEYBOARD_JS, css=CSS)
 
 
